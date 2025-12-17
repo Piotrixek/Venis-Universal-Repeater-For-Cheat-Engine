@@ -1,10 +1,9 @@
 print([[
 ------------------------------------------------------------
-   VENI'S UNIVERSAL REPEATER v3.2
+   VENI'S UNIVERSAL REPEATER v6.0 (Stable)
    Updates:
-   - Fixed Label Definition error on small instructions.
-   - Fixed DB/JMP collision syntax.
-   - Optimized Anti-Spam for Tracer dialog.
+   - Kept 40+53 Prologue detection.
+   - Kept Relative Call auto-fixer.
 
    Made by: Veni
    Discord: ._.veni._.
@@ -14,7 +13,7 @@ print([[
 
 if VeniTimer then VeniTimer.destroy() end
 VeniTimer = createTimer(nil, false)
-VeniTimer.Interval = 300
+VeniTimer.Interval = 200
 VeniTimer.OnTimer = function(t)
   local al = getAddressList()
   for i = 0, al.Count - 1 do
@@ -24,17 +23,16 @@ VeniTimer.OnTimer = function(t)
        if addrStr then
          local clean = string.gsub(addrStr, '["%+%-]', '')
          local sym = 'found_' .. clean
-         local val = readInteger(sym)
 
-         if val and val ~= 0 then
-             -- 1. Disable hoe to stop loop/spam
+         local val = readPointer(sym)
+
+         if val and val > 0 then
              mr.Active = false
-
              local hex = string.format('%X', val)
              print(">> SUCCESS! Caller found for " .. addrStr .. ": " .. hex)
-             messageDialog("✅ CALLER FOUND! \n\nThe function at " .. addrStr .. "\nwas called by: " .. hex .. "\n\nWe have opened the Disassembler at this location for you.", mtInformation, mbOK)
+             messageDialog("✅ CALLER FOUND! \n\nThe function at " .. addrStr .. "\nwas called by: " .. hex .. "\n\nOpening Disassembler...", mtInformation, mbOK)
              getMemoryViewForm().DisassemblerView.SelectedAddress = val
-             writeInteger(sym, 0)
+             writeQword(sym, 0)
          end
        end
     end
@@ -53,11 +51,22 @@ function addVeniRepeater(addr)
   local bytes = readBytes(addrNum, sz, true)
   local opcode = bytes[1]
 
-  --  SCENARIO 1: PROLOGUE DETECTED (Create TRACER!!!!!!)
-  if opcode == 0x55 or (opcode == 0x48 and bytes[2] == 0x83 and bytes[3] == 0xEC) then
-      local answer = messageDialog("⚠️ UNSAFE HOOK: FUNCTION START ⚠️\n\nYou are trying to hook the start of a function.\nLooping this will crash the game.\n\nWould you like to add a 'TRACER' script instead?\nThis will find what is calling this function so you can hook that instead.", mtError, mbYesNo)
+  --  SCENARIO 1: PROLOGUE DETECTED
+  local isPrologue = false
+  -- Standard PUSH
+  if opcode >= 0x50 and opcode <= 0x57 then isPrologue = true end
+  -- Extended PUSH (41 50-57)
+  if opcode == 0x41 and (bytes[2] >= 0x50 and bytes[2] <= 0x57) then isPrologue = true end
+  -- REX PUSH (40-4F 50-57)
+  if opcode >= 0x40 and opcode <= 0x4F and (bytes[2] >= 0x50 and bytes[2] <= 0x57) then isPrologue = true end
+  -- SUB RSP
+  if opcode == 0x48 and (bytes[2] == 0x83 or bytes[2] == 0x81) and bytes[3] == 0xEC then isPrologue = true end
+
+  if isPrologue then
+      local answer = messageDialog("⚠️ UNSAFE HOOK: FUNCTION START ⚠️\n\nTarget: " .. disasm .. "\n\nThis instruction modifies the Stack Pointer.\nLooping it will crash the game.\n\nUse TRACER to find the caller?", mtError, mbYesNo)
 
       if answer == mrNo then return end
+
       local l_found = 'found_' .. clean
       local l_mem = 'trace_' .. clean
       local l_ret = 'ret_' .. clean
@@ -72,13 +81,14 @@ function addVeniRepeater(addr)
       local bts = ''
       for i, v in ipairs(raw) do bts = bts .. string.format('%02X ', v) end
 
+      -- x64: Return address is at [rsp]. We push rax (8 bytes). So it is at [rsp+8].
       local finderCode = ''
       if is64 then
          finderCode = [[
          push rax
          cmp qword ptr []] .. l_found .. [[], 0
          jne @f
-         mov rax, [rsp+8]  // 64-bit Return Address
+         mov rax, [rsp+8]   // Grab Return Address
          mov []] .. l_found .. [[], rax
          @@:
          pop rax
@@ -88,7 +98,7 @@ function addVeniRepeater(addr)
          push eax
          cmp dword ptr []] .. l_found .. [[], 0
          jne @f
-         mov eax, [esp+4]  // 32-bit Return Address
+         mov eax, [esp+4]   // Grab Return Address
          mov []] .. l_found .. [[], eax
          @@:
          pop eax
@@ -97,7 +107,7 @@ function addVeniRepeater(addr)
 
       local scr = [[
 // -----------------------------------------
-//   Tool: Veni's Caller Finder
+//   Tool: Veni's Caller Finder (v6.0)
 //   Target: ]] .. addr .. [[
 //   Author: Veni
 //   Discord: ._.veni._.
@@ -110,8 +120,6 @@ registersymbol(]] .. l_found .. [[)
 
 ]] .. l_mem .. [[:
   ]] .. finderCode .. [[
-
-  // Original Code
   db ]] .. bts .. "\n" .. [[
   jmp ]] .. l_ret .. "\n" .. [[
 
@@ -149,17 +157,39 @@ dealloc(]] .. l_mem .. [[)
       return
   end
 
-  --  SCENARIO 2: UNSAFE RELATIVE (Block)
+  --  SCENARIO 2: RELATIVE CALL/JUMP (Auto-Fixer)
+  local instructionToRun = ""
+  local note = ""
+
   if opcode == 0xE8 or opcode == 0xE9 then
-      messageDialog("⛔ UNSAFE HOOK: RELATIVE INSTRUCTION ⛔\n\nThis instruction moves based on offset. Hooking it will break the game.\nHook the line BEFORE or AFTER this.", mtError, mbOK)
-      return
-  end
-  if opcode == 0xC3 or opcode == 0xC2 then
+      local offset = readInteger(addrNum + 1, true)
+      local targetAddr = addrNum + 5 + offset
+      local targetHex = string.format('%X', targetAddr)
+      note = "// FIXED RELATIVE: Pointing to " .. targetHex
+
+      if opcode == 0xE8 then
+         if is64 then
+            instructionToRun = "mov rax, " .. targetHex .. "\n  call rax"
+         else
+            instructionToRun = "call " .. targetHex
+         end
+      else
+         if is64 then
+            instructionToRun = "mov rax, " .. targetHex .. "\n  jmp rax"
+         else
+            instructionToRun = "jmp " .. targetHex
+         end
+      end
+  elseif opcode == 0xC3 or opcode == 0xC2 then
       messageDialog("⛔ UNSAFE HOOK: RETURN ⛔", mtError, mbOK)
       return
+  else
+      local bts = ''
+      for i, v in ipairs(bytes) do bts = bts .. string.format('%02X ', v) end
+      instructionToRun = "db " .. bts
   end
 
-  --  SCENARIO 3: SAFE INSTRUCTION (Create Repeater)
+  --  SCENARIO 3: CODE GENERATION (Repeater)
   local l_mult = 'rept_' .. clean
   local l_mem = 'mem_' .. clean
   local l_ret = 'ret_' .. clean
@@ -171,9 +201,9 @@ dealloc(]] .. l_mem .. [[)
      local nxt = getInstructionSize(addrNum + tot)
      tot = tot + nxt
   end
-  local raw = readBytes(addrNum, tot, true)
-  local bts = ''
-  for i, v in ipairs(raw) do bts = bts .. string.format('%02X ', v) end
+  local rawOriginal = readBytes(addrNum, tot, true)
+  local btsOriginal = ''
+  for i, v in ipairs(rawOriginal) do btsOriginal = btsOriginal .. string.format('%02X ', v) end
 
   local save = is64 and 'pushfq\npush rax\npush rbx\npush rcx\npush rdx\npush rsi\npush rdi\npush rbp\npush r8\npush r9\npush r10\npush r11\npush r12\npush r13\npush r14\npush r15' or 'pushad\npushfd'
   local rest = is64 and 'pop r15\npop r14\npop r13\npop r12\npop r11\npop r10\npop r9\npop r8\npop rbp\npop rdi\npop rsi\npop rdx\npop rcx\npop rbx\npop rax\npopfq' or 'popfd\npopad'
@@ -201,7 +231,10 @@ registersymbol(]] .. l_mult .. [[)
 
 ]] .. l_loop .. [[:
   ]] .. save .. "\n" .. [[
-  db ]] .. bts .. "\n" .. [[
+
+  ]] .. note .. "\n" .. [[
+  ]] .. instructionToRun .. "\n" .. [[
+
   ]] .. rest .. "\n" .. [[
   dec []] .. l_counter .. [[]
   jnz ]] .. l_loop .. "\n" .. [[
@@ -219,7 +252,7 @@ registersymbol(]] .. l_mult .. [[)
 
 [DISABLE]
 ]] .. addr .. [[:
-  db ]] .. bts .. "\n" .. [[
+  db ]] .. btsOriginal .. "\n" .. [[
 
 unregistersymbol(]] .. l_mult .. [[)
 dealloc(]] .. l_mem .. [[)
@@ -247,6 +280,4 @@ dealloc(]] .. l_mem .. [[)
   print("Repeater hook added for: " .. addr)
 end
 
--- Hook your target wot u want
--- addVeniRepeater('"Tutorial-i386.exe"+26A90')
 addVeniRepeater('"Tutorial-i386.exe"+8ECA2')
