@@ -1,4 +1,4 @@
-# ⚡ Veni's Universal Repeater v3.2
+# ⚡ Veni's Universal Repeater v6.0
 
 **A smart, crash-proof instruction multiplier for Cheat Engine.**
 
